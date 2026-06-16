@@ -45,6 +45,7 @@ import {
 } from "./streaming";
 import { GO_VENDOR, ZEN_VENDOR, AGENT_GO_VENDOR, AGENT_ZEN_VENDOR, resolveBaseVendor, type AllProviderVendor, type ProviderVendor } from "./providerTypes";
 import { isInternalDataPart } from "./chatParts";
+import { PersistentAutocompleteProvider } from "./autocomplete";
 
 import {
   formatCacheHitRatio,
@@ -466,6 +467,21 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("opencodego.setThinkingEffort", () => showThinkingEffortPicker()),
     vscode.commands.registerCommand("opencodego.showUsageDetails", () => showUsageWebview(context)),
   ];
+
+  // ─── Persistent Autocomplete Provider ────────────────────────────────────
+  const autocompleteOutput = vscode.window.createOutputChannel("OpenCode Autocomplete");
+  context.subscriptions.push(autocompleteOutput);
+  const autocompleteProvider = new PersistentAutocompleteProvider(context, autocompleteOutput);
+  const autocompleteRegistration = vscode.languages.registerInlineCompletionItemProvider(
+    { pattern: "**" },
+    autocompleteProvider,
+  );
+  context.subscriptions.push(autocompleteRegistration);
+  context.subscriptions.push(
+    vscode.commands.registerCommand("opencodego.autocompleteAccepted", (args) => {
+      autocompleteOutput.appendLine(`[accepted] sessionId=${args.sessionId} text="${args.text?.slice(0, 50)}..."`);
+    }),
+  );
 
   // Agent-host providers for the Copilot Agents window (opt-in via config).
   const enableAgents = vscode.workspace.getConfiguration("opencodego").get<boolean>("agentsWindow", true);

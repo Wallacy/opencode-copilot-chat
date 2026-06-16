@@ -89,6 +89,10 @@
       {
         "command": "opencodego.showUsageDetails",
         "title": "OpenCode Go: Show Usage Details"
+      },
+      {
+        "command": "opencodego.autocompleteAccepted",
+        "title": "Internal: Autocomplete Accepted"
       }
     ],
     "configuration": {
@@ -197,6 +201,48 @@
           "enum": ["auto", "4096", "16384", "32768", "81920"],
           "default": "auto",
           "markdownDescription": "Optional `thinking_budget` for Qwen models when thinking is `on` or `auto`. `auto` omits the field. Ignored when Qwen thinking is `off`."
+        },
+        "opencodego.autocomplete.enable": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable persistent autocomplete using LLM-powered inline completions. Uses a session-based approach with prompt caching for faster subsequent completions."
+        },
+        "opencodego.autocomplete.model": {
+          "type": "string",
+          "default": "mimo-v2.5",
+          "markdownDescription": "Model ID for persistent autocomplete. Default: `mimo-v2.5`. Any model available on the OpenCode gateway can be used."
+        },
+        "opencodego.autocomplete.maxTokens": {
+          "type": "number",
+          "default": 512,
+          "minimum": 64,
+          "maximum": 4096,
+          "markdownDescription": "Maximum tokens per autocomplete cycle. Higher values allow longer completions but increase latency."
+        },
+        "opencodego.autocomplete.debounceMs": {
+          "type": "number",
+          "default": 300,
+          "minimum": 50,
+          "maximum": 2000,
+          "markdownDescription": "Debounce delay in milliseconds. Wait this long after the user stops typing before sending a request."
+        },
+        "opencodego.autocomplete.maxLoopCycles": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "markdownDescription": "Maximum number of tool-use loop cycles per completion. Each cycle lets the model generate more code after signaling readiness via the `wait_for_input` tool."
+        },
+        "opencodego.autocomplete.useToolLoop": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Use tool-use loop pattern where the model calls `wait_for_input` after each completion, allowing multiple generation cycles per request."
+        },
+        "opencodego.autocomplete.reasoningEffort": {
+          "type": "string",
+          "enum": ["", "off", "low", "medium", "high"],
+          "default": "",
+          "markdownDescription": "Reasoning effort for the autocomplete model. Empty (default) omits the parameter entirely. `off`/`low`/`medium`/`high` adjust reasoning depth."
         }
       }
     },
