@@ -27,7 +27,7 @@ export interface AutocompleteConfig {
   debounceMs: number;
   /** Whether to use tool-use loop pattern */
   useToolLoop: boolean;
-  /** Maximum input tokens (system prompt + history) to control cost */
+  /** Maximum input tokens (system prompt + context) to control cost */
   maxInputTokens: number;
   /** System prompt for the autocomplete model */
   systemPrompt: string;
@@ -37,20 +37,12 @@ export const DEFAULT_AUTOCOMPLETE_CONFIG: AutocompleteConfig = {
   gatewayUrl: "https://opencode.ai/zen/go/v1",
   apiKey: "",
   modelId: "mimo-v2.5",
-  maxTokensPerCycle: 8192,
+  maxTokensPerCycle: 2048,
   maxLoopCycles: 1,
   debounceMs: 800,
   useToolLoop: false,
-  maxInputTokens: 4096,
-  systemPrompt: `You are the inline autocomplete engine inside VS Code.
-Return only the exact code that should be inserted at the cursor.
-
-Rules:
-1. Start the answer immediately with code.
-2. Do not explain, reason out loud, or use markdown fences.
-3. Do not repeat code that already appears in the prefix.
-4. Match the surrounding language, indentation, naming, and style.
-5. Prefer a concise completion, usually one expression, statement, block, or small function body.`,
+  maxInputTokens: 512,
+  systemPrompt: `Do not think. Just complete the code. Output ONLY the code. No markdown, no explanations.`,
 };
 
 // ─── Session State ────────────────────────────────────────────────────────────

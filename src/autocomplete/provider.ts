@@ -383,51 +383,26 @@ export class PersistentAutocompleteProvider implements vscode.InlineCompletionIt
     document: vscode.TextDocument,
     position: vscode.Position,
   ): CodeContextSnapshot {
-    const fullText = document.getText();
+    const allLines = document.getText().split("\n");
     const cursorOffset = document.offsetAt(position);
-    const promptBudgetChars = Math.max(
-      4096,
-      this._config.maxInputTokens * 4 - this._config.systemPrompt.length,
-    );
-    const beforeBudget = Math.floor(promptBudgetChars * 0.75);
-    const afterBudget = promptBudgetChars - beforeBudget;
-    let beforeCursor = fullText.slice(Math.max(0, cursorOffset - beforeBudget), cursorOffset);
-    let afterCursor = fullText.slice(cursorOffset, Math.min(fullText.length, cursorOffset + afterBudget));
 
-    const firstBeforeNewline = beforeCursor.indexOf("\n");
-    if (cursorOffset > beforeCursor.length && firstBeforeNewline >= 0) {
-      beforeCursor = beforeCursor.slice(firstBeforeNewline + 1);
-    }
+    // Only 10 lines before cursor — minimal context, minimal cost.
+    const startLine = Math.max(0, position.line - 10);
+    const beforeLines = allLines.slice(startLine, position.line);
+    const beforeLinePrefix = (allLines[position.line] ?? "").slice(0, position.character);
+    const beforeCursor = [...beforeLines, beforeLinePrefix].join("\n");
 
-    const lastAfterNewline = afterCursor.lastIndexOf("\n");
-    if (cursorOffset + afterCursor.length < fullText.length && lastAfterNewline >= 0) {
-      afterCursor = afterCursor.slice(0, lastAfterNewline);
-    }
+    // 300 chars after cursor (enough for closing braces).
+    const afterCursor = document.getText().slice(cursorOffset, cursorOffset + 300);
 
-    const fileName = document.uri.scheme === "file"
-      ? document.uri.fsPath
-      : document.uri.toString();
-    const prompt = [
-      `File: ${fileName}`,
-      `Language: ${document.languageId}`,
-      "",
-      "Return only the missing code at <CURSOR>.",
-      "Do not repeat prefix text. Do not include markdown or explanations.",
-      "",
-      "<prefix>",
-      beforeCursor,
-      "</prefix>",
-      "<suffix>",
-      afterCursor,
-      "</suffix>",
-      "<completion>",
-    ].join("\n");
+    // Plain prompt: no XML tags, no file metadata. Saves ~150 tokens per request.
+    const prompt = beforeCursor + "<CURSOR>" + afterCursor;
     const fingerprint = [
       document.uri.toString(),
       document.version,
       position.line,
       position.character,
-      hashString(prompt),
+      hashString(beforeCursor.slice(-200)),
     ].join(":");
 
     return {

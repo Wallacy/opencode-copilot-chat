@@ -210,15 +210,15 @@
         "opencodego.autocomplete.model": {
           "type": "string",
           "default": "mimo-v2.5",
-          "enum": ["mimo-v2.5", "mimo-v2.5-pro", "mimo-v2-omni", "mimo-v2-pro", "deepseek-v4-flash", "deepseek-v4-pro", "qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max", "glm-5", "glm-5.1", "kimi-k2.5", "kimi-k2.6", "minimax-m2.5", "minimax-m2.7"],
-          "markdownDescription": "Model for autocomplete. Only OpenCode Go models are listed.",
+          "enum": ["mimo-v2.5", "deepseek-v4-flash"],
+          "markdownDescription": "Model for autocomplete. `mimo-v2.5` (MiMo) is the recommended default for speed/cost. `deepseek-v4-flash` is an alternative but reasoning overhead makes it slower.",
           "when": "opencodego.autocomplete.enable"
         },
         "opencodego.autocomplete.maxTokens": {
           "type": "number",
-          "default": 8192,
-          "minimum": 512,
-          "maximum": 16384,
+          "default": 2048,
+          "minimum": 256,
+          "maximum": 4096,
           "markdownDescription": "Maximum tokens per autocomplete cycle. Higher values allow longer completions but increase latency.",
           "when": "opencodego.autocomplete.enable"
         },
@@ -246,9 +246,9 @@
         },
         "opencodego.autocomplete.maxInputTokens": {
           "type": "number",
-          "default": 4096,
-          "minimum": 512,
-          "maximum": 32768,
+          "default": 1024,
+          "minimum": 256,
+          "maximum": 4096,
           "markdownDescription": "Maximum input tokens (system prompt + history) to control cost. Older messages are trimmed when exceeded.",
           "when": "opencodego.autocomplete.enable"
         }
