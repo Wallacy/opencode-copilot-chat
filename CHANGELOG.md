@@ -6,6 +6,7 @@ All notable changes to the **OpenCode Go BYOK Provider** extension are documente
 
 ### Added
 
+- **`[Feature]` Persistent autocomplete with MiMo V2.5 (opt-in).** New `InlineCompletionItemProvider` that uses a session-based tool-use loop pattern for context-aware code completions. The model maintains conversation history across requests, enabling it to "remember" previous completions and provide more relevant suggestions. Enabled via `opencodego.autocomplete.enable`. Configuration: model (default `mimo-v2.5`), maxTokens (512), debounceMs (300), maxLoopCycles (3), maxInputTokens (4096). All settings use `when` clause — only visible when autocomplete is enabled. Only OpenCode Go models supported. Strips markdown fences from model output for proper VS Code ghost text display.
 - **`[Reliability]` Runtime retry for HTTP 400 parameter errors.** When the upstream API rejects a parameter (thinking, temperature, reasoning_effort), the extension now parses the error message, patches the request body, and retries once automatically. This handles stale models.dev metadata and provider API changes without requiring a code release. Handles: `thinking.type` rejection, `invalid temperature`, `enable_thinking` rejection, `reasoning_effort` format mismatch, and generic `Extra inputs are not permitted`. Implemented in `src/retry.ts` with 8 unit tests + 7 E2E tests (mock server). Body consumption bug fixed to prevent double-read on non-recoverable errors.
 - **`[Tooling]` Model validation script (`scripts/validate-models.mts`).** Pre-release validation that tests ALL thinking/reasoning parameter combinations for each model against the live OpenCode API. Reuses the extension's exact logic (`buildThinkingPayload`, `resolveModelRouting`, `buildOpenCodeGatewayAuthHeaders`) — no duplicated routing/auth/thinking code. Fetches live model list from models.dev. Run: `npm run validate-models -- --api-key YOUR_KEY`. Validated 89 parameter combinations across 18 models (13 Go + 5 Zen free) — all passing.
 - **`[Tooling]` E2E retry test (`scripts/test-retry-e2e.mts`).** Mock server simulates OpenCode API behavior. Proves retry flow: HTTP 400 → `analyzeHttp400ForRetry()` → patch → retry → HTTP 200. Covers 5 recovery scenarios + 2 no-retry scenarios. Run: `npm run test-retry` (no API key needed).
@@ -18,6 +19,7 @@ All notable changes to the **OpenCode Go BYOK Provider** extension are documente
 ### Documentation
 
 - Feature doc: `docs/features/07-20260615-model-validation-retry.md`
+- Feature doc: `docs/features/08-20260616-persistent-autocomplete.md`
 
 Mitigates [#24](https://github.com/ltmoerdani/opencode-copilot-chat/issues/24).
 

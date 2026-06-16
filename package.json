@@ -210,39 +210,47 @@
         "opencodego.autocomplete.model": {
           "type": "string",
           "default": "mimo-v2.5",
-          "markdownDescription": "Model ID for persistent autocomplete. Default: `mimo-v2.5`. Any model available on the OpenCode gateway can be used."
+          "enum": ["mimo-v2.5", "mimo-v2.5-pro", "mimo-v2-omni", "mimo-v2-pro", "deepseek-v4-flash", "deepseek-v4-pro", "qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max", "glm-5", "glm-5.1", "kimi-k2.5", "kimi-k2.6", "minimax-m2.5", "minimax-m2.7"],
+          "markdownDescription": "Model for autocomplete. Only OpenCode Go models are listed.",
+          "when": "opencodego.autocomplete.enable"
         },
         "opencodego.autocomplete.maxTokens": {
           "type": "number",
-          "default": 512,
+          "default": 2048,
           "minimum": 64,
-          "maximum": 4096,
-          "markdownDescription": "Maximum tokens per autocomplete cycle. Higher values allow longer completions but increase latency."
+          "maximum": 8192,
+          "markdownDescription": "Maximum tokens per autocomplete cycle. Higher values allow longer completions but increase latency.",
+          "when": "opencodego.autocomplete.enable"
         },
         "opencodego.autocomplete.debounceMs": {
           "type": "number",
           "default": 300,
           "minimum": 50,
           "maximum": 2000,
-          "markdownDescription": "Debounce delay in milliseconds. Wait this long after the user stops typing before sending a request."
+          "markdownDescription": "Debounce delay in milliseconds. VS Code also has its own built-in debounce for inline suggestions.",
+          "when": "opencodego.autocomplete.enable"
         },
         "opencodego.autocomplete.maxLoopCycles": {
           "type": "number",
-          "default": 3,
+          "default": 2,
           "minimum": 1,
           "maximum": 10,
-          "markdownDescription": "Maximum number of tool-use loop cycles per completion. Each cycle lets the model generate more code after signaling readiness via the `wait_for_input` tool."
+          "markdownDescription": "Maximum experimental tool-use loop cycles per completion.",
+          "when": "opencodego.autocomplete.enable"
         },
         "opencodego.autocomplete.useToolLoop": {
           "type": "boolean",
-          "default": true,
-          "markdownDescription": "Use tool-use loop pattern where the model calls `wait_for_input` after each completion, allowing multiple generation cycles per request."
+          "default": false,
+          "markdownDescription": "Experimental: allow the model to call `wait_for_input` and continue across multiple generation cycles. Disabled by default for lower autocomplete latency.",
+          "when": "opencodego.autocomplete.enable"
         },
-        "opencodego.autocomplete.reasoningEffort": {
-          "type": "string",
-          "enum": ["", "off", "low", "medium", "high"],
-          "default": "",
-          "markdownDescription": "Reasoning effort for the autocomplete model. Empty (default) omits the parameter entirely. `off`/`low`/`medium`/`high` adjust reasoning depth."
+        "opencodego.autocomplete.maxInputTokens": {
+          "type": "number",
+          "default": 4096,
+          "minimum": 512,
+          "maximum": 32768,
+          "markdownDescription": "Maximum input tokens (system prompt + history) to control cost. Older messages are trimmed when exceeded.",
+          "when": "opencodego.autocomplete.enable"
         }
       }
     },

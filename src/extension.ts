@@ -472,6 +472,9 @@ export function activate(context: vscode.ExtensionContext) {
   const autocompleteOutput = vscode.window.createOutputChannel("OpenCode Autocomplete");
   context.subscriptions.push(autocompleteOutput);
   const autocompleteProvider = new PersistentAutocompleteProvider(context, autocompleteOutput);
+  context.subscriptions.push(autocompleteProvider);
+
+  // Register for ALL files — provider filters by language internally
   const autocompleteRegistration = vscode.languages.registerInlineCompletionItemProvider(
     { pattern: "**" },
     autocompleteProvider,
@@ -479,7 +482,9 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(autocompleteRegistration);
   context.subscriptions.push(
     vscode.commands.registerCommand("opencodego.autocompleteAccepted", (args) => {
-      autocompleteOutput.appendLine(`[accepted] sessionId=${args.sessionId} text="${args.text?.slice(0, 50)}..."`);
+      autocompleteOutput.appendLine(
+        `[accepted] sessionId=${args?.sessionId ?? "unknown"} model=${args?.model ?? "unknown"} length=${args?.length ?? "unknown"}`,
+      );
     }),
   );
 

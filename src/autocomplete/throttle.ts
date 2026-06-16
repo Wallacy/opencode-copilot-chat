@@ -72,36 +72,23 @@ export class RequestThrottle {
   }
 
   /**
-   * Check if a request should be skipped (duplicate or too soon).
-   * Returns true if the request should be skipped.
+   * Check if a request should be skipped.
+   * Skips when a request is already in flight — prevents abort cascade
+   * where each keystroke kills the previous request before it finishes.
+   * VS Code calls provideInlineCompletionItems on EVERY keystroke, so
+   * without this guard, the API request never completes.
    */
-  shouldSkip(fingerprint: RequestFingerprint): boolean {
-    // Check if same fingerprint is already pending
-    if (
-      this._pendingFingerprint &&
-      this._pendingFingerprint.documentUri === fingerprint.documentUri &&
-      this._pendingFingerprint.positionLine === fingerprint.positionLine &&
-      this._pendingFingerprint.positionCharacter === fingerprint.positionCharacter &&
-      this._pendingFingerprint.contextHash === fingerprint.contextHash
-    ) {
+  shouldSkip(_fingerprint: RequestFingerprint): boolean {
+    if (this._pendingController) {
       return true;
     }
-
-    // Check minimum interval
-    const now = Date.now();
-    if (now - this._lastRequestTime < this._config.minIntervalMs) {
-      return true;
-    }
-
     return false;
   }
 
   /**
-   * Cancel any pending request and start a new one.
-   * Returns an AbortController that the caller should use.
+   * Start a new request. Cancels the previous one.
    */
   beginRequest(fingerprint: RequestFingerprint): AbortController {
-    // Cancel existing pending request
     if (this._pendingController) {
       this._pendingController.abort();
     }
@@ -111,7 +98,6 @@ export class RequestThrottle {
     this._pendingFingerprint = fingerprint;
     this._lastRequestTime = Date.now();
 
-    // Track request history for debugging
     this._requestHistory.push({ timestamp: Date.now(), fingerprint });
     if (this._requestHistory.length > 50) {
       this._requestHistory = this._requestHistory.slice(-50);

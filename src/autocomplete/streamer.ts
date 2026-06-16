@@ -20,6 +20,7 @@ import type {
   StreamCycleResult,
   StreamSessionResult,
 } from "./types";
+import { WAIT_FOR_INPUT_TOOL } from "./types";
 import { buildOpenCodeGatewayAuthHeaders, type OpenCodeEndpointKind } from "../openCodeAuth";
 
 // ─── SSE Parser ───────────────────────────────────────────────────────────────
@@ -58,6 +59,7 @@ interface CycleAccumulator {
   completionTokens: number;
   firstByteAt: number | undefined;
   buffer: string;
+  reasoningChars: number;
 }
 
 function createAccumulator(): CycleAccumulator {
@@ -74,6 +76,7 @@ function createAccumulator(): CycleAccumulator {
     completionTokens: 0,
     firstByteAt: undefined,
     buffer: "",
+    reasoningChars: 0,
   };
 }
 
@@ -92,7 +95,10 @@ function processSSEChunk(acc: CycleAccumulator, data: unknown): void {
   }
 
   // Detect reasoning content
-  if (delta.reasoning_content) {
+  if (typeof delta.reasoning_content === "string") {
+    acc.hadReasoning = true;
+    acc.reasoningChars += delta.reasoning_content.length;
+  } else if (delta.reasoning_content) {
     acc.hadReasoning = true;
   }
 
@@ -193,6 +199,7 @@ async function streamSingleCycle(
         cachedTokens: 0,
         promptTokens: 0,
         hadReasoning: false,
+        reasoningChars: 0,
         statusCode: response.status,
       };
     }
@@ -250,6 +257,7 @@ async function streamSingleCycle(
       cachedTokens: acc.cachedTokens,
       promptTokens: acc.promptTokens,
       hadReasoning: acc.hadReasoning,
+      reasoningChars: acc.reasoningChars,
       statusCode: response.status,
     };
   } catch (err) {
@@ -268,6 +276,7 @@ async function streamSingleCycle(
       cachedTokens: 0,
       promptTokens: 0,
       hadReasoning: false,
+      reasoningChars: 0,
       statusCode: 0,
     };
   }
@@ -328,8 +337,11 @@ export async function streamSession(
   let cancelled = false;
   let error: string | undefined;
 
-  // Working copy of messages (we append user/assistant/tool messages as we go)
-  const workingMessages: ChatMessage[] = [...messages];
+  // Working copy of messages — starts with session messages + user context
+  const workingMessages: ChatMessage[] = [
+    ...messages,
+    { role: "user", content: codeContext },
+  ];
 
   const maxCycles = config.useToolLoop ? config.maxLoopCycles : 1;
 
@@ -342,46 +354,23 @@ export async function streamSession(
     const cycleStart = Date.now();
 
     // Build request payload
+    // workingMessages already contains the user message from initialization.
+    // After cycle 1 (if tool called), assistant + tool messages are appended.
+    // We do NOT add another user message — the context is already there.
     const body: Record<string, unknown> = {
       model: config.modelId,
-      messages: [...workingMessages, { role: "user", content: codeContext }],
+      messages: workingMessages,
       max_tokens: config.maxTokensPerCycle,
       stream: true,
       stream_options: { include_usage: true },
     };
 
-    if (config.reasoningEffort) {
-      body.reasoning_effort = config.reasoningEffort;
-    }
-
     if (config.useToolLoop) {
-      body.tools = [
-        {
-          type: "function",
-          function: {
-            name: "wait_for_input",
-            description: "Signal you're ready for more input. Always call this after outputting code.",
-            parameters: {
-              type: "object",
-              properties: {
-                status: {
-                  type: "string",
-                  enum: ["ready", "needs_context", "done"],
-                },
-              },
-              required: ["status"],
-            },
-          },
-        },
-      ];
-      body.tool_choice = {
-        type: "function",
-        function: { name: "wait_for_input" },
-      };
+      body.tools = [WAIT_FOR_INPUT_TOOL];
     }
 
     output?.appendLine(
-      `[autocomplete] cycle=${cycle + 1}/${maxCycles} model=${config.modelId} messages=${workingMessages.length + 1}`,
+      `[autocomplete] cycle=${cycle + 1}/${maxCycles} model=${config.modelId} messages=${workingMessages.length}`,
     );
 
     // Stream the cycle
@@ -406,7 +395,8 @@ export async function streamSession(
     output?.appendLine(
       `[autocomplete] cycle=${cycle + 1} ttfb=${cycleResult.ttfbMs}ms total=${cycleResult.totalMs}ms ` +
       `tokens=${cycleResult.completionTokens} cached=${cycleResult.cachedTokens} ` +
-      `tool=${cycleResult.toolCalled} finish=${cycleResult.finishReason} textLen=${cycleResult.text.length}`,
+      `tool=${cycleResult.toolCalled} finish=${cycleResult.finishReason} textLen=${cycleResult.text.length} ` +
+      `reasoning=${cycleResult.hadReasoning} reasoningChars=${cycleResult.reasoningChars}`,
     );
 
     if (cycleResult.statusCode >= 400) {
@@ -419,20 +409,25 @@ export async function streamSession(
       break;
     }
 
-    // If model called the tool, continue the loop
-    if (cycleResult.toolCalled && cycleResult.toolCallId) {
+    // Continue the tool loop if the model called the tool.
+    // finish="length" = cut off mid-function (need more tokens).
+    // finish="tool_calls" = model finished code AND called the tool (can continue).
+    // finish="stop" = model intentionally stopped (don't continue).
+    const shouldContinue = cycleResult.toolCalled && cycleResult.toolCallId &&
+      (cycleResult.finishReason === "length" || cycleResult.finishReason === "tool_calls");
+    if (shouldContinue) {
       hadToolCall = true;
 
-      // Add user message to working history
-      workingMessages.push({ role: "user", content: codeContext });
-
-      // Add assistant message with tool call
+      // Add assistant message with tool call to working history
+      // (Don't add a new user message — the codeContext is already in the
+      //  body's messages from the first cycle. Adding it again would confuse
+      //  the model with duplicating context.)
       workingMessages.push({
         role: "assistant",
         content: cycleResult.text || "",
         tool_calls: [
           {
-            id: cycleResult.toolCallId,
+            id: cycleResult.toolCallId!, // checked above in shouldContinue
             type: "function",
             function: {
               name: cycleResult.toolCallName || "wait_for_input",
@@ -445,10 +440,10 @@ export async function streamSession(
       // Add tool result
       workingMessages.push({
         role: "tool",
-        tool_call_id: cycleResult.toolCallId,
+        tool_call_id: cycleResult.toolCallId!, // checked above in shouldContinue
         content: JSON.stringify({
           status: "ready",
-          message: "User has typed more code. Continue the autocomplete.",
+          message: "Continue the code completion from where you left off. Do NOT restart — just append the next part.",
         }),
       });
 

@@ -6,15 +6,14 @@
  * context across autocomplete requests.
  *
  * Architecture:
- *   User types → Provider extracts code context → Session maintains history
- *   → Stream runs tool-use loop → Model generates code + calls wait_for_input
- *   → Accumulated text returned to VS Code → Session stays alive for next request
+ *   User stops typing → Provider snapshots code context → Stream runs request
+ *   → Accumulated text returned to VS Code as an InlineCompletionItem
+ *   → Lightweight per-document session tracks cache/request metadata
  *
  * Key features:
- *   - Context retention: Model remembers previous completions
- *   - Prompt caching: System prompt cached across requests (~512 tokens)
- *   - Tool-use loop: Model signals readiness for more input
- *   - Debounce: Prevents flooding API during rapid typing
+ *   - Prompt-cache-friendly stable system message
+ *   - Optional experimental tool-use loop
+ *   - Debounce/cancellation for rapid typing
  *   - Model selection: User can choose any model (default: mimo-v2.5)
  *
  * Activation:
@@ -25,11 +24,10 @@
  * Configuration (in settings.json):
  *   "opencodego.autocomplete.enable": true,
  *   "opencodego.autocomplete.model": "mimo-v2.5",
- *   "opencodego.autocomplete.maxTokens": 512,
+ *   "opencodego.autocomplete.maxTokens": 2048,
  *   "opencodego.autocomplete.debounceMs": 300,
- *   "opencodego.autocomplete.maxLoopCycles": 3,
- *   "opencodego.autocomplete.useToolLoop": true,
- *   "opencodego.autocomplete.reasoningEffort": "low"
+ *   "opencodego.autocomplete.maxLoopCycles": 2,
+ *   "opencodego.autocomplete.useToolLoop": false
  */
 
 export { PersistentAutocompleteProvider } from "./provider";

@@ -2,16 +2,12 @@
  * Shared types for the persistent autocomplete module.
  *
  * Architecture:
- *   User types → Provider calls session → Session sends request to gateway
- *   → Model generates code + calls wait_for_input tool → Stream ends
- *   → Session immediately sends next request with tool result → Model continues
- *   → Accumulated text returned to VS Code as InlineCompletionItem
+ *   User stops typing -> Provider snapshots current code context
+ *   -> Streamer sends a chat-completions request to the gateway
+ *   -> Accumulated text returns to VS Code as an InlineCompletionItem.
  *
- * The "never-ending" effect comes from:
- *   1. Session maintains conversation history (context retention)
- *   2. Prompt caching (same prefix = cache hit across requests)
- *   3. Tool-use loop (model signals readiness for more input)
- *   4. Minimal inter-request gap (~1ms HTTP overhead)
+ * Sessions are intentionally lightweight for autocomplete: the system prompt is
+ * stable for prompt caching, while each request sends the current editor state.
  */
 
 // ─── Configuration ────────────────────────────────────────────────────────────
@@ -29,12 +25,10 @@ export interface AutocompleteConfig {
   maxLoopCycles: number;
   /** Debounce delay in ms (user stops typing → send request) */
   debounceMs: number;
-  /** Maximum tokens for the full conversation history */
-  maxHistoryTokens: number;
   /** Whether to use tool-use loop pattern */
   useToolLoop: boolean;
-  /** Reasoning effort ("off" | "low" | "medium" | "high") */
-  reasoningEffort: string;
+  /** Maximum input tokens (system prompt + history) to control cost */
+  maxInputTokens: number;
   /** System prompt for the autocomplete model */
   systemPrompt: string;
 }
@@ -43,24 +37,20 @@ export const DEFAULT_AUTOCOMPLETE_CONFIG: AutocompleteConfig = {
   gatewayUrl: "https://opencode.ai/zen/go/v1",
   apiKey: "",
   modelId: "mimo-v2.5",
-  maxTokensPerCycle: 512,
-  maxLoopCycles: 3,
+  maxTokensPerCycle: 2048,
+  maxLoopCycles: 2,
   debounceMs: 300,
-  maxHistoryTokens: 4096,
-  useToolLoop: true,
-  reasoningEffort: "",  // Empty = don't send (MiMo performs better without it)
-  systemPrompt: `Do not think. Just complete the code.
-
-You are an autocomplete engine embedded in a code editor.
-Your job is to complete code as the user types.
+  useToolLoop: false,
+  maxInputTokens: 4096,
+  systemPrompt: `You are the inline autocomplete engine inside VS Code.
+Return only the exact code that should be inserted at the cursor.
 
 Rules:
-0. DO NOT THINK. DO NOT REASON. Just output the code completion directly.
-1. Output ONLY the code completion — no markdown fences, no explanations.
-2. After outputting code, ALWAYS call the \`wait_for_input\` tool to signal you're ready for more context.
-3. Keep completions concise (under 30 lines).
-4. Never repeat previously generated code.
-5. Match the coding style of the provided context.`,
+1. Start the answer immediately with code.
+2. Do not explain, reason out loud, or use markdown fences.
+3. Do not repeat code that already appears in the prefix.
+4. Match the surrounding language, indentation, naming, and style.
+5. Prefer a concise completion, usually one expression, statement, block, or small function body.`,
 };
 
 // ─── Session State ────────────────────────────────────────────────────────────
@@ -118,6 +108,8 @@ export interface StreamCycleResult {
   promptTokens: number;
   /** Whether reasoning content was detected */
   hadReasoning: boolean;
+  /** Approximate number of reasoning characters streamed by the provider */
+  reasoningChars: number;
   /** HTTP status code */
   statusCode: number;
 }

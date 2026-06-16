@@ -1,230 +1,518 @@
 /**
- * VS Code InlineCompletionItemProvider for persistent autocomplete.
+ * VS Code InlineCompletionItemProvider for OpenCode autocomplete.
  *
- * Integrates:
- *   - Session Manager (context retention across requests)
- *   - Stream Accumulator (SSE parsing + text accumulation)
- *   - Throttle (debounce + cancellation)
- *
- * How it works:
- *   1. User types → provideInlineCompletionItems is called
- *   2. Provider extracts code context around cursor
- *   3. Session maintains conversation history (cache warm after first request)
- *   4. Stream runs with tool-use loop (model calls wait_for_input)
- *   5. Accumulated text returned as InlineCompletionItem
- *   6. Session stays alive for next request (context retained)
- *
- * Configuration:
- *   - opencodego.autocomplete.model: Model ID (default: "mimo-v2.5")
- *   - opencodego.autocomplete.enable: Enable/disable (default: false)
- *   - opencodego.autocomplete.maxTokens: Max tokens per cycle (default: 512)
- *   - opencodego.autocomplete.debounceMs: Debounce delay (default: 300)
- *   - opencodego.autocomplete.maxLoopCycles: Max tool-use loop cycles (default: 3)
- *   - opencodego.autocomplete.useToolLoop: Use tool-use loop (default: true)
- *   - opencodego.autocomplete.reasoningEffort: Reasoning effort (default: "low")
+ * VS Code cancels inline suggestion queries aggressively. Remote LLM requests
+ * are much slower than that lifecycle, so the provider runs them in the
+ * background, caches successful results, and asks VS Code to query again when
+ * a cached item is ready.
  */
 
 import * as vscode from "vscode";
-import type { AutocompleteConfig, StreamSessionResult } from "./types";
+import type { AutocompleteConfig } from "./types";
 import { DEFAULT_AUTOCOMPLETE_CONFIG } from "./types";
 import { AutocompleteSession, SessionManager } from "./session";
 import { streamSession } from "./streamer";
-import { RequestThrottle, computeFingerprint, extractCodeContext, type ThrottleConfig } from "./throttle";
 
-// ─── Provider ─────────────────────────────────────────────────────────────────
+const AUTOCOMPLETE_SECRET_KEY = "opencodego.apiKey";
+const RESULT_CACHE_TTL_MS = 15_000;
+
+interface ActiveRequest {
+  controller: AbortController;
+  documentUri: string;
+  fingerprint: string;
+  startedAt: number;
+}
+
+interface CompletionRequest {
+  apiKey: string;
+  document: vscode.TextDocument;
+  inlineContext: vscode.InlineCompletionContext;
+  position: vscode.Position;
+  snapshot: CodeContextSnapshot;
+  startedAt: number;
+}
+
+interface CachedResult {
+  fingerprint: string;
+  createdAt: number;
+  list: vscode.InlineCompletionList;
+}
+
+interface CodeContextSnapshot {
+  prompt: string;
+  fingerprint: string;
+  beforeCursor: string;
+}
+
+function emptyList(): vscode.InlineCompletionList {
+  return new vscode.InlineCompletionList([]);
+}
+
+function hashString(value: string): string {
+  let hash = 0;
+  for (let i = 0; i < value.length; i++) {
+    hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0;
+  }
+  return hash.toString(36);
+}
+
+function stripMarkdownFences(text: string): string {
+  let result = text.replace(/\r\n/g, "\n").replace(/<CURSOR>/g, "");
+
+  result = result.replace(/^\s*```[^\n]*\n/, "");
+  result = result.replace(/\n\s*```\s*$/, "");
+  result = result.replace(/^```[^\n]*\n/gm, "");
+  result = result.replace(/^\s*```\s*$/gm, "");
+
+  return result.replace(/\s+$/g, "");
+}
+
+function removeOverlappingPrefix(completion: string, beforeCursor: string): string {
+  const maxOverlap = Math.min(completion.length, beforeCursor.length, 160);
+
+  for (let length = maxOverlap; length >= 3; length--) {
+    if (completion.startsWith(beforeCursor.slice(-length))) {
+      return completion.slice(length);
+    }
+  }
+
+  return completion;
+}
+
+function toEditorEol(text: string, document: vscode.TextDocument): string {
+  if (document.eol === vscode.EndOfLine.CRLF) {
+    return text.replace(/\n/g, "\r\n");
+  }
+
+  return text.replace(/\r\n/g, "\n");
+}
 
 export class PersistentAutocompleteProvider implements vscode.InlineCompletionItemProvider {
-  private _sessionManager: SessionManager;
-  private _throttle: RequestThrottle;
-  private _output: vscode.OutputChannel;
+  private readonly _context: vscode.ExtensionContext;
+  private readonly _output: vscode.OutputChannel;
+  private readonly _sessionManager: SessionManager;
   private _enabled: boolean;
   private _config: AutocompleteConfig;
-
-  /** Status bar item showing autocomplete state */
-  private _statusBarItem: vscode.StatusBarItem | undefined;
+  private _apiKey: string | undefined;
+  private _activeRequest: ActiveRequest | undefined;
+  private _debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  private _lastResult: CachedResult | undefined;
+  private _pendingRequest: CompletionRequest | undefined;
+  private _queuedRequest: CompletionRequest | undefined;
+  private _statusBar: vscode.StatusBarItem;
+  private _statusTimer: ReturnType<typeof setTimeout> | undefined;
+  private _loggedMissingKey = false;
 
   constructor(
     context: vscode.ExtensionContext,
     outputChannel: vscode.OutputChannel,
     config?: Partial<AutocompleteConfig>,
   ) {
+    this._context = context;
     this._output = outputChannel;
     this._config = { ...DEFAULT_AUTOCOMPLETE_CONFIG, ...config };
     this._enabled = vscode.workspace
       .getConfiguration("opencodego")
       .get("autocomplete.enable", false);
-
     this._sessionManager = new SessionManager(this._config);
 
-    const throttleConfig: Partial<ThrottleConfig> = {
-      debounceMs: this._config.debounceMs,
-      minIntervalMs: 500,
-      maxPending: 1,
-    };
-    this._throttle = new RequestThrottle(throttleConfig);
-
-    // Status bar
-    this._statusBarItem = vscode.window.createStatusBarItem(
+    this._statusBar = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Right,
       93,
     );
-    this._statusBarItem.text = "$(sparkle) Autocomplete";
-    this._statusBarItem.tooltip = "Persistent Autocomplete (MiMo)";
-    context.subscriptions.push(this._statusBarItem);
 
-    // Listen for config changes
     context.subscriptions.push(
-      vscode.workspace.onDidChangeConfiguration((e) => {
-        if (e.affectsConfiguration("opencodego.autocomplete")) {
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration("opencodego.autocomplete")) {
           this._reloadConfig();
+        }
+      }),
+      context.secrets.onDidChange((event) => {
+        if (event.key === AUTOCOMPLETE_SECRET_KEY) {
+          void this._refreshApiKey();
         }
       }),
     );
 
-    this._log(`Persistent autocomplete initialized (enabled=${this._enabled}, model=${this._config.modelId})`);
+    void this._refreshApiKey();
+    this._setStatus("idle");
+    this._log(`initialized enabled=${this._enabled} model=${this._config.modelId}`);
   }
-
-  // ─── InlineCompletionItemProvider ─────────────────────────────────────────
 
   provideInlineCompletionItems(
     document: vscode.TextDocument,
     position: vscode.Position,
-    context: vscode.InlineCompletionContext,
-    token: vscode.CancellationToken,
+    inlineContext: vscode.InlineCompletionContext,
+    _token: vscode.CancellationToken,
   ): vscode.ProviderResult<vscode.InlineCompletionList> {
-    if (!this._enabled) {
-      return { items: [] };
+    if (!this._enabled || !this._isSupportedDocument(document)) {
+      return emptyList();
     }
 
-    // Skip if triggered by select (only respond to typing)
-    if (context.triggerKind === vscode.InlineCompletionTriggerKind.Automatic) {
-      // Check if we're in a comment or string — skip autocomplete
-      const lineText = document.lineAt(position.line).text;
-      const trimmed = lineText.trimStart();
-      if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("*")) {
-        return { items: [] };
-      }
+    if (this._shouldSkipPosition(document, position, inlineContext)) {
+      return emptyList();
     }
 
-    return this._provideCompletions(document, position, token);
+    if (!this._apiKey) {
+      void this._refreshApiKey();
+      return emptyList();
+    }
+
+    const snapshot = this._buildCodeContext(document, position);
+    const cached = this._getCachedResult(snapshot.fingerprint);
+    if (cached) {
+      this._log(`cache hit fingerprint=${snapshot.fingerprint}`);
+      return cached;
+    }
+
+    this._scheduleRequest({
+      apiKey: this._apiKey,
+      document,
+      inlineContext,
+      position,
+      snapshot,
+      startedAt: Date.now(),
+    });
+
+    return emptyList();
   }
 
-  // ─── Internal Implementation ──────────────────────────────────────────────
+  private _scheduleRequest(request: CompletionRequest): void {
+    this._pendingRequest = request;
 
-  private async _provideCompletions(
+    if (this._debounceTimer) {
+      clearTimeout(this._debounceTimer);
+    }
+
+    this._debounceTimer = setTimeout(() => {
+      this._debounceTimer = undefined;
+      this._startPendingRequest();
+    }, this._config.debounceMs);
+  }
+
+  private _startPendingRequest(): void {
+    const request = this._pendingRequest;
+    this._pendingRequest = undefined;
+
+    if (!request || !this._enabled) {
+      return;
+    }
+
+    const cached = this._getCachedResult(request.snapshot.fingerprint);
+    if (cached) {
+      this._triggerInlineSuggest("pending request already cached");
+      return;
+    }
+
+    const active = this._activeRequest;
+    if (active) {
+      if (active.fingerprint === request.snapshot.fingerprint) {
+        this._log(`already running fingerprint=${request.snapshot.fingerprint}`);
+        return;
+      }
+
+      this._queuedRequest = request;
+      this._log(
+        `queued latest fingerprint=${request.snapshot.fingerprint} ` +
+        `behind active=${active.fingerprint}`,
+      );
+      active.controller.abort();
+      return;
+    }
+
+    this._beginRequest(request);
+  }
+
+  private _beginRequest(request: CompletionRequest): void {
+    const activeRequest: ActiveRequest = {
+      controller: new AbortController(),
+      documentUri: request.document.uri.toString(),
+      fingerprint: request.snapshot.fingerprint,
+      startedAt: request.startedAt,
+    };
+
+    this._activeRequest = activeRequest;
+    void this._executeActiveRequest(activeRequest, request);
+  }
+
+  private async _executeActiveRequest(
+    activeRequest: ActiveRequest,
+    request: CompletionRequest,
+  ): Promise<void> {
+    try {
+      const session = this._sessionManager.getOrCreate(activeRequest.documentUri);
+      this._setStatus("loading");
+      this._log(
+        `request start session=${session.id} model=${this._config.modelId} ` +
+        `cacheWarm=${session.info.cacheWarmed} docVersion=${request.document.version}`,
+      );
+
+      const list = await this._runCompletionRequest(
+        request.document,
+        request.position,
+        request.inlineContext,
+        session,
+        request.snapshot,
+        request.apiKey,
+        activeRequest.controller.signal,
+      );
+
+      if (list.items.length > 0 && !activeRequest.controller.signal.aborted) {
+        this._lastResult = {
+          fingerprint: request.snapshot.fingerprint,
+          createdAt: Date.now(),
+          list,
+        };
+        this._triggerInlineSuggest("completion cached");
+      }
+
+      const elapsed = Date.now() - activeRequest.startedAt;
+      this._log(`request end elapsed=${elapsed}ms items=${list.items.length}`);
+    } finally {
+      if (this._activeRequest === activeRequest) {
+        this._activeRequest = undefined;
+      }
+
+      const queued = this._queuedRequest;
+      this._queuedRequest = undefined;
+      if (queued && this._enabled) {
+        this._beginRequest(queued);
+      }
+    }
+  }
+
+  private async _runCompletionRequest(
     document: vscode.TextDocument,
     position: vscode.Position,
-    token: vscode.CancellationToken,
+    inlineContext: vscode.InlineCompletionContext,
+    session: AutocompleteSession,
+    snapshot: CodeContextSnapshot,
+    apiKey: string,
+    signal: AbortSignal,
   ): Promise<vscode.InlineCompletionList> {
-    const startTime = Date.now();
+    const result = await streamSession({
+      url: `${this._config.gatewayUrl}/chat/completions`,
+      apiKey,
+      config: this._config,
+      messages: session.sessionStartMessages.slice(),
+      codeContext: snapshot.prompt,
+      signal,
+      output: this._output,
+    });
 
-    try {
-      // Compute fingerprint for deduplication
-      const codeContext = extractCodeContext(
-        { getText: () => document.getText(), lineCount: document.lineCount },
-        position.line,
-      );
-      const fp = computeFingerprint(document.uri.toString(), position.line, position.character, codeContext);
-
-      // Skip if same request is already pending
-      if (this._throttle.shouldSkip(fp)) {
-        this._log("Skipping duplicate request");
-        return { items: [] };
-      }
-
-      // Cancel any pending request
-      const controller = this._throttle.beginRequest(fp);
-
-      // Update status bar
-      this._updateStatusBar("loading");
-
-      try {
-        // Get or create session for this document
-        const session = this._sessionManager.getOrCreate(document.uri.toString());
-
-        this._log(
-          `Starting completion (session=${session.id}, state=${session.state}, ` +
-          `cache=${session.info.cacheWarmed}, requests=${session.info.requestCount})`,
-        );
-
-        // Run stream session with tool-use loop
-        const result = await streamSession({
-          url: this._config.gatewayUrl + "/chat/completions",
-          apiKey: this._config.apiKey,
-          config: this._config,
-          messages: session.messages,
-          codeContext,
-          signal: controller.signal,
-          output: this._output,
-        });
-
-        // Record the exchange in the session
-        if (result.error) {
-          this._log(`Stream error: ${result.error}`);
-          this._updateStatusBar("error");
-          return { items: [] };
-        }
-
-        if (result.cancelled) {
-          this._log("Stream cancelled");
-          this._updateStatusBar("idle");
-          return { items: [] };
-        }
-
-        if (!result.accumulatedText) {
-          this._log("Empty completion");
-          this._updateStatusBar("idle");
-          return { items: [] };
-        }
-
-        // Record in session for context retention
-        session.recordExchange(
-          codeContext,
-          result.accumulatedText,
-          result.hadToolCall
-            ? [{ id: "tool-auto", name: "wait_for_input", arguments: '{"status":"ready"}' }]
-            : undefined,
-          undefined,
-          result.totalTokens,
-        );
-
-        // Build completion item
-        const item = new vscode.InlineCompletionItem(
-          result.accumulatedText,
-          new vscode.Range(position, position),
-        );
-
-        // Add command to show details on accept
-        item.command = {
-          command: "opencodego.autocompleteAccepted",
-          title: "Autocomplete Accepted",
-          arguments: [{ sessionId: session.id, text: result.accumulatedText }],
-        };
-
-        const elapsed = Date.now() - startTime;
-        this._log(
-          `Completion ready (${elapsed}ms, ${result.accumulatedText.length} chars, ` +
-          `${result.cycles.length} cycles, ${result.totalTokens} tokens)`,
-        );
-
-        this._updateStatusBar("success");
-
-        return { items: [item] };
-      } finally {
-        this._throttle.endRequest(controller);
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this._log(`Error: ${message}`);
-      this._updateStatusBar("error");
-      return { items: [] };
+    if (result.cancelled || signal.aborted) {
+      this._setStatus("idle");
+      return emptyList();
     }
+
+    if (result.error) {
+      this._log(`stream error: ${result.error}`);
+      this._setStatus("error");
+      return emptyList();
+    }
+
+    const completion = this._normalizeCompletion(
+      result.accumulatedText,
+      snapshot.beforeCursor,
+      document,
+    );
+
+    if (!completion) {
+      this._log(
+        `empty completion cycles=${result.cycles.length} tokens=${result.totalTokens} ` +
+        `reasoning=${result.cycles.some((cycle) => cycle.hadReasoning)}`,
+      );
+      this._setStatus("idle");
+      return emptyList();
+    }
+
+    session.markRequestComplete(result.totalTokens);
+
+    const range = inlineContext.selectedCompletionInfo?.range ?? new vscode.Range(position, position);
+    const insertText = this._withSelectedCompletionPrefix(
+      completion,
+      inlineContext.selectedCompletionInfo,
+    );
+    const item = new vscode.InlineCompletionItem(insertText, range);
+    item.filterText = insertText;
+    item.command = {
+      command: "opencodego.autocompleteAccepted",
+      title: "Autocomplete Accepted",
+      arguments: [{
+        sessionId: session.id,
+        model: this._config.modelId,
+        length: insertText.length,
+      }],
+    };
+
+    this._log(
+      `completion ready chars=${insertText.length} cycles=${result.cycles.length} ` +
+      `tokens=${result.totalTokens} tool=${result.hadToolCall}`,
+    );
+    this._log(`preview=${JSON.stringify(insertText.slice(0, 160))}`);
+    this._setStatus("success");
+
+    return new vscode.InlineCompletionList([item]);
   }
 
-  // ─── Configuration ────────────────────────────────────────────────────────
+  private _normalizeCompletion(
+    rawText: string,
+    beforeCursor: string,
+    document: vscode.TextDocument,
+  ): string {
+    const withoutMarkdown = stripMarkdownFences(rawText);
+    const withoutOverlap = removeOverlappingPrefix(withoutMarkdown, beforeCursor);
+    return toEditorEol(withoutOverlap, document);
+  }
+
+  private _withSelectedCompletionPrefix(
+    completion: string,
+    selectedInfo: vscode.SelectedCompletionInfo | undefined,
+  ): string {
+    if (!selectedInfo?.text || completion.startsWith(selectedInfo.text)) {
+      return completion;
+    }
+
+    return `${selectedInfo.text}${completion}`;
+  }
+
+  private _buildCodeContext(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+  ): CodeContextSnapshot {
+    const fullText = document.getText();
+    const cursorOffset = document.offsetAt(position);
+    const promptBudgetChars = Math.max(
+      4096,
+      this._config.maxInputTokens * 4 - this._config.systemPrompt.length,
+    );
+    const beforeBudget = Math.floor(promptBudgetChars * 0.75);
+    const afterBudget = promptBudgetChars - beforeBudget;
+    let beforeCursor = fullText.slice(Math.max(0, cursorOffset - beforeBudget), cursorOffset);
+    let afterCursor = fullText.slice(cursorOffset, Math.min(fullText.length, cursorOffset + afterBudget));
+
+    const firstBeforeNewline = beforeCursor.indexOf("\n");
+    if (cursorOffset > beforeCursor.length && firstBeforeNewline >= 0) {
+      beforeCursor = beforeCursor.slice(firstBeforeNewline + 1);
+    }
+
+    const lastAfterNewline = afterCursor.lastIndexOf("\n");
+    if (cursorOffset + afterCursor.length < fullText.length && lastAfterNewline >= 0) {
+      afterCursor = afterCursor.slice(0, lastAfterNewline);
+    }
+
+    const fileName = document.uri.scheme === "file"
+      ? document.uri.fsPath
+      : document.uri.toString();
+    const prompt = [
+      `File: ${fileName}`,
+      `Language: ${document.languageId}`,
+      "",
+      "Return only the missing code at <CURSOR>.",
+      "Do not repeat prefix text. Do not include markdown or explanations.",
+      "",
+      "<prefix>",
+      beforeCursor,
+      "</prefix>",
+      "<suffix>",
+      afterCursor,
+      "</suffix>",
+      "<completion>",
+    ].join("\n");
+    const fingerprint = [
+      document.uri.toString(),
+      document.version,
+      position.line,
+      position.character,
+      hashString(prompt),
+    ].join(":");
+
+    return {
+      prompt,
+      fingerprint,
+      beforeCursor,
+    };
+  }
+
+  private _isSupportedDocument(document: vscode.TextDocument): boolean {
+    return document.uri.scheme === "file" || document.uri.scheme === "untitled";
+  }
+
+  private _shouldSkipPosition(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    inlineContext: vscode.InlineCompletionContext,
+  ): boolean {
+    if (position.line >= document.lineCount) {
+      return true;
+    }
+
+    const line = document.lineAt(position.line).text;
+    const beforeCursor = line.slice(0, position.character);
+    const trimmed = beforeCursor.trimStart();
+
+    if (inlineContext.triggerKind === vscode.InlineCompletionTriggerKind.Automatic) {
+      if (!beforeCursor.trim() && position.character === 0) {
+        return true;
+      }
+
+      if (
+        trimmed.startsWith("//") ||
+        trimmed.startsWith("#") ||
+        trimmed.startsWith("*") ||
+        trimmed.startsWith("/*") ||
+        trimmed.startsWith("<!--")
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private _getCachedResult(fingerprint: string): vscode.InlineCompletionList | undefined {
+    if (
+      this._lastResult?.fingerprint === fingerprint &&
+      Date.now() - this._lastResult.createdAt < RESULT_CACHE_TTL_MS
+    ) {
+      return this._lastResult.list;
+    }
+
+    return undefined;
+  }
+
+  private _triggerInlineSuggest(reason: string): void {
+    this._log(`triggering inline suggest (${reason})`);
+    setTimeout(() => {
+      void vscode.commands.executeCommand("editor.action.inlineSuggest.trigger").then(
+        undefined,
+        (error) => {
+          this._log(
+            `inline suggest trigger failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        },
+      );
+    }, 0);
+  }
+
+  private async _refreshApiKey(): Promise<void> {
+    this._apiKey = await this._context.secrets.get(AUTOCOMPLETE_SECRET_KEY);
+
+    if (!this._apiKey && this._enabled && !this._loggedMissingKey) {
+      this._loggedMissingKey = true;
+      this._log("OpenCode Go API key not found; run 'OpenCode Go: Set API Key'.");
+    }
+
+    if (this._apiKey) {
+      this._loggedMissingKey = false;
+    }
+
+    this._setStatus("idle");
+  }
 
   private _reloadConfig(): void {
     const cfg = vscode.workspace.getConfiguration("opencodego");
+    const previousModel = this._config.modelId;
     this._enabled = cfg.get("autocomplete.enable", false);
     this._config = {
       ...this._config,
@@ -233,79 +521,108 @@ export class PersistentAutocompleteProvider implements vscode.InlineCompletionIt
       debounceMs: cfg.get("autocomplete.debounceMs", DEFAULT_AUTOCOMPLETE_CONFIG.debounceMs),
       maxLoopCycles: cfg.get("autocomplete.maxLoopCycles", DEFAULT_AUTOCOMPLETE_CONFIG.maxLoopCycles),
       useToolLoop: cfg.get("autocomplete.useToolLoop", DEFAULT_AUTOCOMPLETE_CONFIG.useToolLoop),
-      reasoningEffort: cfg.get("autocomplete.reasoningEffort", DEFAULT_AUTOCOMPLETE_CONFIG.reasoningEffort),
+      maxInputTokens: cfg.get("autocomplete.maxInputTokens", DEFAULT_AUTOCOMPLETE_CONFIG.maxInputTokens),
     };
     this._sessionManager.updateConfig(this._config);
-    this._throttle.dispose();
-    this._throttle = new RequestThrottle({
-      debounceMs: this._config.debounceMs,
-      minIntervalMs: 500,
-      maxPending: 1,
-    });
-    this._log(`Config reloaded: model=${this._config.modelId}, toolLoop=${this._config.useToolLoop}`);
+    this._lastResult = undefined;
+    this._clearPendingWork();
+
+    if (!this._enabled || previousModel !== this._config.modelId) {
+      this._sessionManager.destroyAll();
+    }
+
+    this._setStatus("idle");
+    this._log(
+      `config reloaded enabled=${this._enabled} model=${this._config.modelId} ` +
+      `toolLoop=${this._config.useToolLoop}`,
+    );
   }
 
-  /**
-   * Update the model used for autocomplete.
-   */
   setModel(modelId: string): void {
     this._config.modelId = modelId;
     this._sessionManager.updateConfig({ modelId });
-    this._log(`Model changed to ${modelId}`);
-    // Destroy existing sessions since they use the old model
     this._sessionManager.destroyAll();
+    this._lastResult = undefined;
+    this._clearPendingWork();
+    this._setStatus("idle");
+    this._log(`model changed to ${modelId}`);
   }
 
-  /**
-   * Enable or disable the autocomplete provider.
-   */
   setEnabled(enabled: boolean): void {
     this._enabled = enabled;
+    this._lastResult = undefined;
+
     if (!enabled) {
       this._sessionManager.destroyAll();
-      this._throttle.dispose();
+      this._clearPendingWork();
     }
-    this._log(`Autocomplete ${enabled ? "enabled" : "disabled"}`);
+
+    this._setStatus("idle");
+    this._log(`autocomplete ${enabled ? "enabled" : "disabled"}`);
   }
 
-  // ─── Status Bar ───────────────────────────────────────────────────────────
+  private _clearPendingWork(): void {
+    if (this._debounceTimer) {
+      clearTimeout(this._debounceTimer);
+      this._debounceTimer = undefined;
+    }
 
-  private _updateStatusBar(state: "idle" | "loading" | "success" | "error"): void {
-    if (!this._statusBarItem) return;
+    this._activeRequest?.controller.abort();
+    this._activeRequest = undefined;
+    this._pendingRequest = undefined;
+    this._queuedRequest = undefined;
+  }
+
+  private _setStatus(state: "idle" | "loading" | "success" | "error"): void {
+    if (this._statusTimer) {
+      clearTimeout(this._statusTimer);
+      this._statusTimer = undefined;
+    }
+
+    if (!this._enabled) {
+      this._statusBar.hide();
+      return;
+    }
+
+    this._statusBar.show();
+
+    if (!this._apiKey) {
+      this._statusBar.text = "$(key) OpenCode AC";
+      this._statusBar.tooltip = "OpenCode Autocomplete: API key missing";
+      return;
+    }
 
     switch (state) {
       case "loading":
-        this._statusBarItem.text = "$(sync~spin) Autocomplete";
-        this._statusBarItem.tooltip = "Generating completion...";
+        this._statusBar.text = "$(sync~spin) OpenCode AC";
+        this._statusBar.tooltip = `OpenCode Autocomplete: generating with ${this._config.modelId}`;
         break;
       case "success":
-        this._statusBarItem.text = "$(sparkle) Autocomplete";
-        this._statusBarItem.tooltip = "Completion ready";
-        // Auto-reset after 2s
-        setTimeout(() => this._updateStatusBar("idle"), 2000);
+        this._statusBar.text = "$(sparkle) OpenCode AC";
+        this._statusBar.tooltip = "OpenCode Autocomplete: completion ready";
+        this._statusTimer = setTimeout(() => this._setStatus("idle"), 2000);
         break;
       case "error":
-        this._statusBarItem.text = "$(warning) Autocomplete";
-        this._statusBarItem.tooltip = "Completion error";
-        setTimeout(() => this._updateStatusBar("idle"), 3000);
+        this._statusBar.text = "$(warning) OpenCode AC";
+        this._statusBar.tooltip = "OpenCode Autocomplete: request failed";
+        this._statusTimer = setTimeout(() => this._setStatus("idle"), 3000);
         break;
       default:
-        this._statusBarItem.text = "$(sparkle) Autocomplete";
-        this._statusBarItem.tooltip = "Persistent Autocomplete (idle)";
+        this._statusBar.text = "$(sparkle) OpenCode AC";
+        this._statusBar.tooltip = `OpenCode Autocomplete: ${this._config.modelId}`;
     }
   }
-
-  // ─── Logging ──────────────────────────────────────────────────────────────
 
   private _log(message: string): void {
     this._output.appendLine(`[persistent-ac] ${message}`);
   }
 
-  // ─── Cleanup ──────────────────────────────────────────────────────────────
-
   dispose(): void {
+    this._clearPendingWork();
     this._sessionManager.destroyAll();
-    this._throttle.dispose();
-    this._statusBarItem?.dispose();
+    this._statusBar.dispose();
+    if (this._statusTimer) {
+      clearTimeout(this._statusTimer);
+    }
   }
 }
