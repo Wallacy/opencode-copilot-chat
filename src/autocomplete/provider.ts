@@ -211,12 +211,15 @@ export class PersistentAutocompleteProvider implements vscode.InlineCompletionIt
         return;
       }
 
+      // Queue the request but do NOT abort the active one.
+      // Let it complete — aborting causes "This operation was aborted" and
+      // the queued one likely gets aborted too (cascade). Instead, let the
+      // active request finish, then start the queued one.
       this._queuedRequest = request;
       this._log(
         `queued latest fingerprint=${request.snapshot.fingerprint} ` +
         `behind active=${active.fingerprint}`,
       );
-      active.controller.abort();
       return;
     }
 

@@ -216,23 +216,23 @@
         },
         "opencodego.autocomplete.maxTokens": {
           "type": "number",
-          "default": 2048,
-          "minimum": 64,
-          "maximum": 8192,
+          "default": 8192,
+          "minimum": 512,
+          "maximum": 16384,
           "markdownDescription": "Maximum tokens per autocomplete cycle. Higher values allow longer completions but increase latency.",
           "when": "opencodego.autocomplete.enable"
         },
         "opencodego.autocomplete.debounceMs": {
           "type": "number",
-          "default": 300,
-          "minimum": 50,
-          "maximum": 2000,
+          "default": 800,
+          "minimum": 100,
+          "maximum": 3000,
           "markdownDescription": "Debounce delay in milliseconds. VS Code also has its own built-in debounce for inline suggestions.",
           "when": "opencodego.autocomplete.enable"
         },
         "opencodego.autocomplete.maxLoopCycles": {
           "type": "number",
-          "default": 2,
+          "default": 1,
           "minimum": 1,
           "maximum": 10,
           "markdownDescription": "Maximum experimental tool-use loop cycles per completion.",

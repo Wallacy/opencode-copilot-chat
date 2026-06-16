@@ -37,9 +37,9 @@ export const DEFAULT_AUTOCOMPLETE_CONFIG: AutocompleteConfig = {
   gatewayUrl: "https://opencode.ai/zen/go/v1",
   apiKey: "",
   modelId: "mimo-v2.5",
-  maxTokensPerCycle: 2048,
-  maxLoopCycles: 2,
-  debounceMs: 300,
+  maxTokensPerCycle: 8192,
+  maxLoopCycles: 1,
+  debounceMs: 800,
   useToolLoop: false,
   maxInputTokens: 4096,
   systemPrompt: `You are the inline autocomplete engine inside VS Code.
