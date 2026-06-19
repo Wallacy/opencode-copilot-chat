@@ -216,10 +216,10 @@
         },
         "opencodego.autocomplete.maxTokens": {
           "type": "number",
-          "default": 2048,
+          "default": 8192,
           "minimum": 256,
-          "maximum": 4096,
-          "markdownDescription": "Maximum tokens per autocomplete cycle. Higher values allow longer completions but increase latency.",
+          "maximum": 32768,
+          "markdownDescription": "Maximum tokens per autocomplete cycle. Higher values allow longer completions but increase latency. Reasoning tokens count against this budget unless reasoning_effort is set to 'none'.",
           "when": "opencodego.autocomplete.enable"
         },
         "opencodego.autocomplete.debounceMs": {

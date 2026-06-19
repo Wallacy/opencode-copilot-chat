@@ -22,6 +22,8 @@ import type {
 } from "./types";
 import { WAIT_FOR_INPUT_TOOL } from "./types";
 import { buildOpenCodeGatewayAuthHeaders, type OpenCodeEndpointKind } from "../openCodeAuth";
+import { buildThinkingPayload } from "../thinking";
+import type { ThinkingSettings } from "../thinking";
 
 // ─── SSE Parser ───────────────────────────────────────────────────────────────
 
@@ -172,6 +174,7 @@ async function streamSingleCycle(
   authHeaders: Record<string, string>,
   signal: AbortSignal,
   onTextChunk?: (text: string) => void,
+  output?: vscode.OutputChannel,
 ): Promise<StreamCycleResult> {
   const requestStartMs = Date.now();
   const acc = createAccumulator();
@@ -186,6 +189,10 @@ async function streamSingleCycle(
 
     if (!response.ok) {
       const errBody = await response.text();
+      // Log error body for debugging — critical for diagnosing rejected params.
+      output?.appendLine(
+        `[autocomplete] HTTP ${response.status} error body: ${errBody.slice(0, 500)}`,
+      );
       return {
         text: "",
         toolCalled: false,
@@ -293,8 +300,10 @@ export interface StreamSessionOptions {
   config: AutocompleteConfig;
   /** Current conversation messages (without the user message for this request) */
   messages: readonly ChatMessage[];
-  /** Code context to send as user message */
-  codeContext: string;
+  /** Code before the cursor (used as assistant prefix) */
+  beforeCursor: string;
+  /** Code after the cursor (for context) */
+  afterCursor: string;
   /** Abort signal for cancellation */
   signal: AbortSignal;
   /** Callback for real-time text updates */
@@ -322,7 +331,8 @@ export async function streamSession(
     apiKey,
     config,
     messages,
-    codeContext,
+    beforeCursor,
+    afterCursor,
     signal,
     onTextChunk,
     output,
@@ -337,10 +347,26 @@ export async function streamSession(
   let cancelled = false;
   let error: string | undefined;
 
-  // Working copy of messages — starts with session messages + user context
+  // Direct prompt pattern — all context in a single user message.
+  // The assistant prefix approach failed because Mimo rewrites the entire file
+  // instead of continuing from the cursor position.
+  // This approach explicitly tells the model what exists and what to generate.
+  const userContent = [
+    `Complete the TypeScript code at the cursor position. Output ONLY the code to insert. Do NOT include code before or after the cursor.`,
+    ``,
+    `Code before cursor (already exists, do NOT repeat):`,
+    `\`\`\``,
+    beforeCursor,
+    `\`\`\``,
+    ``,
+    afterCursor
+      ? `Code after cursor (for context only, do NOT include in output):\n\`\`\`\n${afterCursor}\n\`\`\``
+      : `(End of file — generate closing braces if needed)`,
+  ].join("\n");
+
   const workingMessages: ChatMessage[] = [
     ...messages,
-    { role: "user", content: codeContext },
+    { role: "user", content: userContent },
   ];
 
   const maxCycles = config.useToolLoop ? config.maxLoopCycles : 1;
@@ -357,13 +383,35 @@ export async function streamSession(
     // workingMessages already contains the user message from initialization.
     // After cycle 1 (if tool called), assistant + tool messages are appended.
     // We do NOT add another user message — the context is already there.
+
+    // Autocomplete: disable thinking as aggressively as possible per model family.
+    // DeepSeek/Mimo only support reasoning_effort (no "none" value — causes 400).
+    // "low" is the minimum. Other families support thinking: { type: "disabled" }.
+    const autocThinking: ThinkingSettings = {
+      deepseek: "low",
+      mimo: "low",
+      glm: "off",
+      kimi: "off",
+      minimax: "off",
+      qwen: "off",
+      qwenBudget: "auto",
+    };
+
     const body: Record<string, unknown> = {
       model: config.modelId,
       messages: workingMessages,
       max_tokens: config.maxTokensPerCycle,
       stream: true,
       stream_options: { include_usage: true },
+      temperature: 0,
+      ...buildThinkingPayload(config.modelId, autocThinking),
     };
+
+    // Log which thinking parameters were applied for debugging.
+    const thinkingParams = buildThinkingPayload(config.modelId, autocThinking);
+    output?.appendLine(
+      `[autocomplete] thinking params: ${JSON.stringify(thinkingParams)}`,
+    );
 
     if (config.useToolLoop) {
       body.tools = [WAIT_FOR_INPUT_TOOL];
@@ -385,6 +433,7 @@ export async function streamSession(
           onTextChunk(accumulatedText + text);
         }
       },
+      output,
     );
 
     allCycles.push(cycleResult);

@@ -31,18 +31,22 @@ export interface AutocompleteConfig {
   maxInputTokens: number;
   /** System prompt for the autocomplete model */
   systemPrompt: string;
+  /** Number of lines after cursor to include as context */
+  suffixLines: number;
 }
 
 export const DEFAULT_AUTOCOMPLETE_CONFIG: AutocompleteConfig = {
   gatewayUrl: "https://opencode.ai/zen/go/v1",
   apiKey: "",
-  modelId: "mimo-v2.5",
-  maxTokensPerCycle: 2048,
+  modelId: "deepseek-v4-flash",
+  maxTokensPerCycle: 8192,
   maxLoopCycles: 1,
   debounceMs: 800,
   useToolLoop: false,
   maxInputTokens: 512,
-  systemPrompt: `Do not think. Just complete the code. Output ONLY the code. No markdown, no explanations.`,
+  systemPrompt: `You are a code completion engine. Do not think. You receive code before and after the cursor. Generate ONLY the code to insert at the cursor position. Do NOT repeat or rewrite existing code. Output ONLY the missing code. No markdown fences, no explanations.`,
+  /** Code lines shown after the cursor for context (closing braces, etc.) */
+  suffixLines: 10,
 };
 
 // ─── Session State ────────────────────────────────────────────────────────────

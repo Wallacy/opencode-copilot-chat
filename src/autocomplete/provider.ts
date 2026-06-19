@@ -39,9 +39,12 @@ interface CachedResult {
 }
 
 interface CodeContextSnapshot {
-  prompt: string;
-  fingerprint: string;
+  /** Code before the cursor (assistant prefix) */
   beforeCursor: string;
+  /** Code after the cursor (for context) */
+  afterCursor: string;
+  /** Cache fingerprint */
+  fingerprint: string;
 }
 
 function emptyList(): vscode.InlineCompletionList {
@@ -298,7 +301,8 @@ export class PersistentAutocompleteProvider implements vscode.InlineCompletionIt
       apiKey,
       config: this._config,
       messages: session.sessionStartMessages.slice(),
-      codeContext: snapshot.prompt,
+      beforeCursor: snapshot.beforeCursor,
+      afterCursor: snapshot.afterCursor,
       signal,
       output: this._output,
     });
@@ -386,17 +390,19 @@ export class PersistentAutocompleteProvider implements vscode.InlineCompletionIt
     const allLines = document.getText().split("\n");
     const cursorOffset = document.offsetAt(position);
 
-    // Only 10 lines before cursor — minimal context, minimal cost.
+    // 10 lines before cursor — minimal context for fast autocomplete.
     const startLine = Math.max(0, position.line - 10);
     const beforeLines = allLines.slice(startLine, position.line);
     const beforeLinePrefix = (allLines[position.line] ?? "").slice(0, position.character);
     const beforeCursor = [...beforeLines, beforeLinePrefix].join("\n");
 
-    // 300 chars after cursor (enough for closing braces).
-    const afterCursor = document.getText().slice(cursorOffset, cursorOffset + 300);
+    // 10 lines after cursor for context (closing braces, etc.).
+    const endLine = Math.min(allLines.length, position.line + 10);
+    const afterCursor = allLines.slice(position.line, endLine).join("\n");
 
-    // Plain prompt: no XML tags, no file metadata. Saves ~150 tokens per request.
-    const prompt = beforeCursor + "<CURSOR>" + afterCursor;
+    // No complex prompt needed — the streamer constructs messages using the
+    // assistant prefix pattern: [system, user(suffix), assistant(beforeCursor)].
+    // The model naturally continues the assistant message with the completion.
     const fingerprint = [
       document.uri.toString(),
       document.version,
@@ -406,9 +412,9 @@ export class PersistentAutocompleteProvider implements vscode.InlineCompletionIt
     ].join(":");
 
     return {
-      prompt,
-      fingerprint,
       beforeCursor,
+      afterCursor,
+      fingerprint,
     };
   }
 
